@@ -1,0 +1,92 @@
+name: Mirror verified macOS 0.1.7
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-macos-0.1.7
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download previously published signed artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paprwork-mirror"
+          cd "$RUNNER_TEMP/paprwork-mirror"
+          for file in Paprwork-0.1.7-arm64.dmg Paprwork-0.1.7-arm64-mac.zip Paprwork-0.1.7-arm64.dmg.blockmap Paprwork-0.1.7-arm64-mac.zip.blockmap latest-mac.yml; do
+            curl --fail --location --retry 3 --max-time 300 "https://paprwork-updates.yz-a5b.workers.dev/$file" --output "$file"
+          done
+          shasum -a 256 -c <<'SUMS'
+          59727a36e6e16cfdc6f946d525ec5c58a55bd4a2ea53b53bfb760bc202755252  latest-mac.yml
+          e654c309bc1289178aa5257013d16cf64d0e10017c8d4db8a227c8acadd69768  Paprwork-0.1.7-arm64-mac.zip
+          7b3e98203be46518ce2635002473e0e32cc104cb183e3a18379138ad3ea98572  Paprwork-0.1.7-arm64-mac.zip.blockmap
+          4d8b4680c2832a82ccde8c10e298bad1eddd09c2d60879a6e0d778bd47396581  Paprwork-0.1.7-arm64.dmg
+          ccf2ebb0803937f2d3e7080e72de35b0dfb5e5ebc7ee7a94a06821eee9d80e3a  Paprwork-0.1.7-arm64.dmg.blockmap
+          SUMS
+      - name: Verify signature and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/paprwork-mirror"
+          ditto -x -k Paprwork-0.1.7-arm64-mac.zip verify
+          codesign --verify --deep --strict -R='anchor apple generic and identifier "com.paprwork.desktop" and certificate leaf[subject.OU] = "P769CSFDA9"' verify/Paprwork.app
+          xcrun stapler validate verify/Paprwork.app
+      - name: Upload verified assets and publish draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: overdev-team/Paprwork-Releases
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/paprwork-mirror"
+          node <<'JS'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const crypto = require('node:crypto');
+          const repo = 'overdev-team/Paprwork-Releases';
+          const gh = (...args) => cp.execFileSync('gh', args, {encoding:'utf8', maxBuffer: 8*1024*1024});
+          let release = JSON.parse(gh('api', `repos/${repo}/releases`, '--paginate', '--slurp')).flat().find(r => r.tag_name === 'v0.1.7');
+          if (!release) throw Error('Expected owner-created 0.1.7 draft release');
+          let manifest = fs.readFileSync('latest-mac.yml','utf8');
+          manifest = manifest.replace(/(^\s*(?:-\s+)?(?:url|path):\s*)(Paprwork-0\.1\.7-arm64(?:-mac\.zip|\.dmg))$/gm, '$1https://github.com/'+repo+'/releases/download/v0.1.7/$2');
+          fs.writeFileSync('latest-mac.yml',manifest);
+          (async () => {
+            for (const name of ['Paprwork-0.1.7-arm64.dmg','Paprwork-0.1.7-arm64-mac.zip','Paprwork-0.1.7-arm64.dmg.blockmap','Paprwork-0.1.7-arm64-mac.zip.blockmap','latest-mac.yml']) {
+              const hash=crypto.createHash('sha256');
+              for await (const chunk of fs.createReadStream(name)) hash.update(chunk);
+              const digest='sha256:'+hash.digest('hex');
+              const size=fs.statSync(name).size;
+              const existing=release.assets.find(a=>a.name===name);
+              if (existing) {
+                if(existing.state!=='uploaded'||existing.size!==size||existing.digest!==digest)throw Error('Existing asset mismatch: '+name);
+                console.log('Verified existing '+name);
+              } else {
+                if(!release.draft)throw Error('Published release missing '+name);
+                gh('release','upload','v0.1.7',name,'--repo',repo);
+                release=JSON.parse(gh('api',`repos/${repo}/releases/${release.id}`));
+                const stored=release.assets.find(a=>a.name===name);
+                if(!stored||stored.state!=='uploaded'||stored.size!==size||stored.digest!==digest)throw Error('Uploaded asset mismatch: '+name);
+                console.log('Uploaded and verified '+name);
+              }
+            }
+            let latest=true;
+            const published=JSON.parse(gh('api',`repos/${repo}/releases`,'--paginate','--slurp')).flat().filter(r=>!r.draft&&!r.prerelease);
+            for(const r of published){
+              if(!/^v\d+\.\d+\.\d+$/.test(r.tag_name))throw Error('Unexpected stable tag');
+              const v=r.tag_name.slice(1).split('.').map(Number);
+              if(v[0]>0||v[1]>1||(v[1]===1&&v[2]>7))latest=false;
+            }
+            if(release.draft)gh('release','edit','v0.1.7','--repo',repo,'--draft=false','--latest='+latest);
+            console.log('Verified public macOS 0.1.7 release');
+          })().catch(error=>{console.error(error.message);process.exitCode=1});
+          JS
