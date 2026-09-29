@@ -11,6 +11,11 @@ on:
         description: Commit SHA reported by the signed tag push webhook
         required: true
         type: string
+      validate_only:
+        description: Verify the private tag and read-only checkout without building
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -54,6 +59,7 @@ jobs:
           echo "Verified $RELEASE_TAG at $RELEASE_SHA"
 
   macos:
+    if: ${{ !inputs.validate_only }}
     needs: validate
     runs-on: macos-15
     timeout-minutes: 50
@@ -132,6 +138,7 @@ jobs:
         run: node script/publish_github_release.mjs --platform=darwin --apply
 
   windows:
+    if: ${{ !inputs.validate_only }}
     needs: validate
     runs-on: windows-2025
     timeout-minutes: 50
