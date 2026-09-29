@@ -1,6 +1,8 @@
 name: Build and publish Paprwork desktop
 
 on:
+  repository_dispatch:
+    types: [paprwork_release_tag]
   workflow_dispatch:
     inputs:
       tag:
@@ -20,8 +22,12 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.tag || inputs.tag }}
+  RELEASE_SHA: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || inputs.sha }}
+
 concurrency:
-  group: desktop-release-${{ inputs.tag }}
+  group: desktop-release-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.tag || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -31,9 +37,6 @@ jobs:
     steps:
       - name: Validate immutable release input
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -42,16 +45,13 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: overdev-team/Paprwork
-          ref: refs/tags/${{ inputs.tag }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
       - name: Verify source commit and desktop version
         shell: bash
         working-directory: source
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
@@ -59,7 +59,7 @@ jobs:
           echo "Verified $RELEASE_TAG at $RELEASE_SHA"
 
   macos:
-    if: ${{ !inputs.validate_only }}
+    if: ${{ (github.event_name == 'repository_dispatch' && !github.event.client_payload.validate_only) || (github.event_name == 'workflow_dispatch' && !inputs.validate_only) }}
     needs: validate
     runs-on: macos-15
     timeout-minutes: 50
@@ -89,7 +89,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: overdev-team/Paprwork
-          ref: ${{ inputs.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -125,7 +125,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: Paprwork-${{ inputs.tag }}-macOS
+          name: Paprwork-${{ env.RELEASE_TAG }}-macOS
           path: |
             source/dist/electron/*.dmg
             source/dist/electron/*.zip
@@ -138,7 +138,7 @@ jobs:
         run: node script/publish_github_release.mjs --platform=darwin --apply
 
   windows:
-    if: ${{ !inputs.validate_only }}
+    if: ${{ (github.event_name == 'repository_dispatch' && !github.event.client_payload.validate_only) || (github.event_name == 'workflow_dispatch' && !inputs.validate_only) }}
     needs: validate
     runs-on: windows-2025
     timeout-minutes: 50
@@ -167,7 +167,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: overdev-team/Paprwork
-          ref: ${{ inputs.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source
@@ -222,7 +222,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: Paprwork-${{ inputs.tag }}-Windows-x64
+          name: Paprwork-${{ env.RELEASE_TAG }}-Windows-x64
           path: |
             source/dist/electron/*.exe
             source/dist/electron/*.exe.blockmap
@@ -258,7 +258,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: overdev-team/Paprwork
-          ref: ${{ inputs.sha }}
+          ref: ${{ env.RELEASE_SHA }}
           ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
           path: source

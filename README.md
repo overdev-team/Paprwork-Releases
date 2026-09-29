@@ -1,7 +1,9 @@
 # Paprwork-Releases
+
 Public desktop release artifacts and build workflow for Paprwork. Source code
-remains private. A signed webhook from the private source repository dispatches
-the workflow with a version tag and commit SHA; a read-only Deploy Key checks
+remains private. A signed webhook from the private source repository sends a
+`paprwork_release_tag` repository dispatch event with the version tag and
+commit SHA; a read-only Deploy Key checks
 out that exact source commit on public GitHub-hosted runners. Source files are
 not published to this repository or uploaded as Actions artifacts.
 
