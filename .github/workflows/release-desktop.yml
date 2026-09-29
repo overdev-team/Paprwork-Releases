@@ -1,0 +1,281 @@
+name: Build and publish Paprwork desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable version tag in the private Paprwork repository
+        required: true
+        type: string
+      sha:
+        description: Commit SHA reported by the signed tag push webhook
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate immutable release input
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Check out exact private source tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: overdev-team/Paprwork
+          ref: refs/tags/${{ inputs.tag }}
+          ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - name: Verify source commit and desktop version
+        shell: bash
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          node -e 'const p = require("./apps/desktop/package.json"); if ("v" + p.version !== process.env.RELEASE_TAG) process.exit(1)'
+          echo "Verified $RELEASE_TAG at $RELEASE_SHA"
+
+  macos:
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 50
+    permissions:
+      contents: write
+    env:
+      MAIN_VITE_PAPRWORK_WEBSITE_URL: https://paprwork.ovey.org
+      CSC_LINK: ${{ secrets.MACOS_CERTIFICATE }}
+      CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify release credentials
+        shell: bash
+        run: |
+          missing=0
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "$(printenv "$name")" ]; then
+              echo "::error::$name is not configured"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+      - name: Check out verified private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: overdev-team/Paprwork
+          ref: ${{ inputs.sha }}
+          ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.17.0
+      - name: Install pnpm
+        run: npm install --global pnpm@10.32.1
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+      - name: Run existing release checks
+        working-directory: source
+        run: pnpm check
+      - name: Build, sign, and notarize macOS release
+        working-directory: source
+        run: pnpm --filter @paprwork/desktop run package:mac
+      - name: Verify signature and notarization ticket
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          app_path=$(find dist/electron -maxdepth 2 -type d -name Paprwork.app -print -quit)
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+      - name: Verify packaged resources and update artifacts
+        working-directory: source
+        run: |
+          pnpm check:package
+          pnpm check:update-artifacts
+      - name: Preserve signed release artifacts
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Paprwork-${{ inputs.tag }}-macOS
+          path: |
+            source/dist/electron/*.dmg
+            source/dist/electron/*.zip
+            source/dist/electron/*.blockmap
+            source/dist/electron/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 30
+      - name: Stage verified macOS files to GitHub Releases
+        working-directory: source
+        run: node script/publish_github_release.mjs --platform=darwin --apply
+
+  windows:
+    needs: validate
+    runs-on: windows-2025
+    timeout-minutes: 50
+    permissions:
+      contents: write
+    outputs:
+      eligible: ${{ steps.check_eligibility.outputs.eligible }}
+    env:
+      MAIN_VITE_PAPRWORK_WEBSITE_URL: https://paprwork.ovey.org
+      WIN_CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check publication eligibility
+        id: check_eligibility
+        shell: bash
+        env:
+          ALLOW_UNSIGNED_WINDOWS_RELEASE: ${{ vars.ALLOW_UNSIGNED_WINDOWS_RELEASE }}
+        run: |
+          if [ -n "$WIN_CSC_LINK" ] || [ "$ALLOW_UNSIGNED_WINDOWS_RELEASE" = "true" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out verified private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: overdev-team/Paprwork
+          ref: ${{ inputs.sha }}
+          ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.17.0
+      - name: Install pnpm
+        run: npm install --global pnpm@10.32.1
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+      - name: Build and typecheck packages
+        working-directory: source
+        run: |
+          pnpm run build:packages
+          pnpm --filter @paprwork/desktop run typecheck
+      - name: Build Windows x64 installer
+        working-directory: source
+        run: pnpm --filter @paprwork/desktop run package:win
+      - name: Verify packaged resources and update artifacts
+        working-directory: source
+        run: |
+          node script/verify_electron_package.mjs dist/electron/win-unpacked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node script/publish_electron_updates.mjs --platform=win32
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify signed Windows release
+        if: env.WIN_CSC_LINK != ''
+        working-directory: source
+        run: |
+          $files = @('dist/electron/win-unpacked/Paprwork.exe') + @(Get-ChildItem dist/electron/*.exe | ForEach-Object FullName)
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $file" }
+          }
+      - name: Verify packaged Windows app launches
+        working-directory: source
+        run: |
+          $application = Start-Process (Resolve-Path 'dist/electron/win-unpacked/Paprwork.exe') -PassThru -RedirectStandardError "$env:RUNNER_TEMP/paprwork-stderr.log"
+          try {
+            Start-Sleep -Seconds 15
+            $application.Refresh()
+            if ($application.HasExited) { throw 'Paprwork exited during startup.' }
+            if ($application.MainWindowHandle -eq 0) { throw 'Paprwork did not open its main window.' }
+            $errors = Get-Content "$env:RUNNER_TEMP/paprwork-stderr.log" -Raw
+            if ($errors -match 'renderer process exited:|renderer failed to load|Uncaught Exception') { throw $errors }
+            Write-Output "Paprwork opened: $($application.MainWindowTitle)"
+          } finally {
+            if (-not $application.HasExited) { Stop-Process -Id $application.Id -Force }
+          }
+      - name: Preserve Windows release artifacts
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Paprwork-${{ inputs.tag }}-Windows-x64
+          path: |
+            source/dist/electron/*.exe
+            source/dist/electron/*.exe.blockmap
+            source/dist/electron/latest.yml
+          if-no-files-found: error
+          retention-days: 30
+      - name: Stage verified Windows files to GitHub Releases
+        if: steps.check_eligibility.outputs.eligible == 'true'
+        shell: bash
+        working-directory: source
+        run: node script/publish_github_release.mjs --platform=win32 --apply
+
+  finalize:
+    needs: [validate, macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: desktop-finalize-production
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Verify R2 credentials
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+      - name: Check out verified private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: overdev-team/Paprwork
+          ref: ${{ inputs.sha }}
+          ssh-key: ${{ secrets.PAPRWORK_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.17.0
+      - name: Install pnpm
+        run: npm install --global pnpm@10.32.1
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+      - name: Finalize verified public release
+        id: finalize_release
+        working-directory: source
+        run: node script/publish_github_release.mjs --finalize --windows-eligible=${{ needs.windows.outputs.eligible }} --download-dir=dist/electron --apply
+      - name: Publish verified files to Cloudflare R2
+        if: steps.finalize_release.outputs.published_latest == 'true'
+        shell: bash
+        working-directory: source
+        run: |
+          pnpm run publish:update-artifacts
+          if [ "${{ needs.windows.outputs.eligible }}" = "true" ]; then
+            node script/publish_electron_updates.mjs --platform=win32 --apply
+          fi
+      - name: Preserve latest pointers for an older tag rerun
+        if: steps.finalize_release.outputs.published_latest != 'true'
+        run: echo "Older tag rerun; R2 latest pointers remain unchanged."
